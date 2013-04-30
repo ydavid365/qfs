@@ -39,9 +39,9 @@ endif (DEFINED KFS_DIR_PREFIX)
 # Locate Boost
 # set(Boost_LIB_DIAGNOSTIC_DEFINITIONS "-DBOOST_LIB_DIAGNOSTIC")
 
-if (NOT CYGWIN)
-    set(Boost_USE_STATIC_LIBS   ON)
-endif (NOT CYGWIN)
+if (NOT DEFINED Boost_USE_STATIC_LIBS)
+    set(Boost_USE_STATIC_LIBS OFF)
+endif (NOT DEFINED Boost_USE_STATIC_LIBS)
 
 set(Boost_USE_MULTITHREADED ON)
 
@@ -165,6 +165,7 @@ add_subdirectory (${KFS_DIR_PREFIX}src/cc/qcdio src/cc/qcdio)
 add_subdirectory (${KFS_DIR_PREFIX}src/cc/qcrs src/cc/qcrs)
 
 add_subdirectory (${KFS_DIR_PREFIX}examples/cc examples/cc)
+add_subdirectory (${KFS_DIR_PREFIX}benchmarks/mstress benchmarks/mstress)
 
 IF (NOT ${JAVA_INCLUDE_PATH} STREQUAL "" AND NOT DEFINED JNI_FOUND)
     set(JNI_FOUND TRUE)

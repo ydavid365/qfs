@@ -880,10 +880,10 @@ struct MetaAllocate: public MetaRequest, public  KfsCallbackObj {
     int                  firstFailedServerIdx;
     bool                 logFlag;
     bool                 invalidateAllFlag;
+    const Permissions*   permissions;
     MetaAllocate*        next;
     int64_t              leaseId;
     chunkOff_t           chunkBlockStart;
-    Permissions          permissions;
     MetaLeaseRelinquish* pendingLeaseRelinquish;
     string               responseStr; // Cached response
     // With StringBufT instead of string the append allocation (presently
@@ -910,10 +910,10 @@ struct MetaAllocate: public MetaRequest, public  KfsCallbackObj {
           firstFailedServerIdx(-1),
           logFlag(true),
           invalidateAllFlag(false),
+          permissions(0),
           next(0),
           leaseId(-1),
           chunkBlockStart(-1),
-          permissions(),
           pendingLeaseRelinquish(0),
           responseStr(),
           clientHost(),
@@ -957,6 +957,8 @@ struct MetaAllocate: public MetaRequest, public  KfsCallbackObj {
 struct MetaTruncate: public MetaRequest {
     fid_t           fid;      //!< file for which space has to be allocated
     chunkOff_t      offset;   //!< offset to truncate the file to
+    chunkOff_t      endOffset;
+    bool            setEofHintFlag; //!< set eof is the most frequently used
     //!< set if the blks from the beginning of the file to the offset have
     //!< to be deleted.
     bool            pruneBlksFromHead;
@@ -966,6 +968,8 @@ struct MetaTruncate: public MetaRequest {
         : MetaRequest(META_TRUNCATE, true),
           fid(-1),
           offset(-1),
+          endOffset(-1),
+          setEofHintFlag(true),
           pruneBlksFromHead(false),
           pathname(),
           mtime()
@@ -996,6 +1000,8 @@ struct MetaTruncate: public MetaRequest {
         .Def("Offset",          &MetaTruncate::offset,          chunkOff_t(-1))
         .Def("Pathname",        &MetaTruncate::pathname                       )
         .Def("Prune-from-head", &MetaTruncate::pruneBlksFromHead,        false)
+        .Def("End-offset",      &MetaTruncate::endOffset,       chunkOff_t(-1))
+        .Def("Set-eof",         &MetaTruncate::setEofHintFlag,            true)
         ;
     }
 };
@@ -2311,9 +2317,9 @@ struct MetaCheckpoint : public MetaRequest {
           pid(-1),
           failedCount(0),
           maxFailedCount(2),
-          chekpointWriteTimeoutSec(60 * 60),
-          chekpointWriteSyncFlag(true),
-          chekpointWriteBufferSize(16 << 20),
+          checkpointWriteTimeoutSec(60 * 60),
+          checkpointWriteSyncFlag(true),
+          checkpointWriteBufferSize(16 << 20),
           lastCheckpointId(-1),
           runningCheckpointId(-1),
           lastRun(0)
@@ -2336,9 +2342,9 @@ private:
     int    pid;
     int    failedCount;
     int    maxFailedCount;
-    int    chekpointWriteTimeoutSec;
-    bool   chekpointWriteSyncFlag;
-    size_t chekpointWriteBufferSize;
+    int    checkpointWriteTimeoutSec;
+    bool   checkpointWriteSyncFlag;
+    size_t checkpointWriteBufferSize;
     seq_t  lastCheckpointId;
     seq_t  runningCheckpointId;
     time_t lastRun;

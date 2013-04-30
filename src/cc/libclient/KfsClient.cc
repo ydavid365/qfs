@@ -222,6 +222,12 @@ KfsClient::Cd(const char *pathname)
     return mImpl->Cd(pathname);
 }
 
+int
+KfsClient::SetCwd(const char* pathname)
+{
+    return mImpl->SetCwd(pathname);
+}
+
 string
 KfsClient::GetCwd()
 {
@@ -280,9 +286,15 @@ KfsClient::OpenDirectory(const char *pathname)
 }
 
 int
-KfsClient::Stat(const char *pathname, KfsFileAttr &result, bool computeFilesize)
+KfsClient::Stat(const char *pathname, KfsFileAttr& result, bool computeFilesize)
 {
     return mImpl->Stat(pathname, result, computeFilesize);
+}
+
+int
+KfsClient::Stat(int fd, KfsFileAttr& result)
+{
+    return mImpl->Stat(fd, result);
 }
 
 int
@@ -319,6 +331,14 @@ int
 KfsClient::EnumerateBlocks(const char* pathname, KfsClient::BlockInfos& res)
 {
     return mImpl->EnumerateBlocks(pathname, res);
+}
+
+int
+KfsClient::GetReplication(const char* pathname,
+    KfsFileAttr& attr, int& minChunkReplication, int& maxChunkReplication)
+{
+    return mImpl->GetReplication(pathname, attr,
+        minChunkReplication, maxChunkReplication);
 }
 
 int
@@ -605,6 +625,13 @@ KfsClient::SetReplicationFactor(const char *pathname, int16_t numReplicas)
     return mImpl->SetReplicationFactor(pathname, numReplicas);
 }
 
+int16_t
+KfsClient::SetReplicationFactorR(const char *pathname, int16_t numReplicas,
+    ErrorHandler* errHandler)
+{
+    return mImpl->SetReplicationFactorR(pathname, numReplicas, errHandler);
+}
+
 ServerLocation
 KfsClient::GetMetaserverLocation() const
 {
@@ -811,6 +838,19 @@ KfsClient::GetUserAndGroupNames(kfsUid_t user, kfsGid_t group,
     return mImpl->GetUserAndGroupNames(user, group, uname, gname);
 }
 
+int
+KfsClient::GetUserAndGroupIds(const char* user, const char* group,
+    kfsUid_t& uid, kfsGid_t& gid)
+{
+    return mImpl->GetUserAndGroupIds(user, group, uid, gid);
+}
+
+kfsUid_t
+KfsClient::GetUserId()
+{
+    return mImpl->GetUserId();
+}
+
 namespace client
 {
 
@@ -926,11 +966,14 @@ private:
         }
         void AddUserHeader(uid_t uid)
         {
-            struct passwd  pwebuf = {0};
-            struct passwd* pwe    = 0;
-            char   namebuf[1024];
-            getpwuid_r(uid, &pwebuf, namebuf, sizeof(namebuf), &pwe);
-            if (pwe && pwe->pw_name) {
+            struct passwd      pwebuf = {0};
+            struct passwd*     pwe    = 0;
+            StBufferT<char, 1> buf;
+            buf.Resize((size_t)
+                max(long(8) << 10, sysconf(_SC_GETPW_R_SIZE_MAX)));
+            const int err = getpwuid_r(uid, &pwebuf,
+                buf.GetPtr(), buf.GetSize(), &pwe);
+            if (! err && (pwe && pwe->pw_name)) {
                 string hdr("User: ");
                 for (const char* p = pwe->pw_name; *p != 0; p++) {
                     const int c = *p & 0xFF;
@@ -1054,7 +1097,7 @@ private:
         }
         const Globals& globals = Globals::Get();
         client.mEUser  = globals.mEUser;
-        client.mEUser  = globals.mEUser;
+        client.mEGroup = globals.mEGroup;
         client.mGroups = globals.mGroups;
         return 0;
     }
@@ -1121,7 +1164,13 @@ KfsClientImpl::KfsClientImpl()
       mUserIds(),
       mGroupIds(),
       mTmpInputStream(),
-      mTmpOutputStream()
+      mTmpOutputStream(),
+      mNameBufSize((size_t)max(max(
+        sysconf(_SC_GETPW_R_SIZE_MAX),
+        sysconf(_SC_GETGR_R_SIZE_MAX)),
+        long(8) << 10)
+      ),
+      mNameBuf(new char[mNameBufSize])
 {
     ClientsList::Insert(*this);
 
@@ -1149,6 +1198,7 @@ KfsClientImpl::~KfsClientImpl()
     while (it != mFileTable.end()) {
         delete *it++;
     }
+    delete [] mNameBuf;
 }
 
 void
@@ -1242,6 +1292,42 @@ KfsClientImpl::Cd(const char *pathname)
         return -ENOTDIR;
     }
     mCwd = path;
+    return 0;
+}
+
+int
+KfsClientImpl::SetCwd(const char *pathname)
+{
+    if (! pathname) {
+        return -EFAULT;
+    }
+
+    QCStMutexLocker l(mMutex);
+
+    size_t       len = strlen(pathname);
+    const char*  ptr = GetTmpAbsPath(pathname, len);
+    if (! mTmpAbsPath.Set(ptr, len)) {
+        return -EINVAL;
+    }
+    const size_t      sz       = mTmpAbsPath.size();
+    const Path::Token kRootDir = Path::Token("/", 1);
+    if (sz < 1 || mTmpAbsPath[0] != kRootDir) {
+        return -EINVAL;
+    }
+    const Path::Token kThisDir(".",    1);
+    const Path::Token kParentDir("..", 2);
+    for (size_t i = 1; i < sz; i++) {
+        const Path::Token& cname = mTmpAbsPath[i];
+        if (cname == kThisDir || cname.mLen <= 0 || cname == kParentDir) {
+            continue;
+        }
+        mTmpDirName.assign(cname.mPtr, cname.mLen);
+        int res;
+        if ((res = ValidateName(mTmpDirName)) != 0) {
+            return res;
+        }
+    }
+    mCwd = mTmpAbsPath.NormPath();
     return 0;
 }
 
@@ -2159,12 +2245,26 @@ KfsClientImpl::ReaddirPlus(const string& pathname, kfsFileId_t dirFid,
 }
 
 int
-KfsClientImpl::Stat(const char *pathname, KfsFileAttr &kfsattr, bool computeFilesize)
+KfsClientImpl::Stat(const char *pathname, KfsFileAttr& kfsattr, bool computeFilesize)
 {
     QCStMutexLocker l(mMutex);
     const bool kValidSubCountsRequiredFlag = true;
     return StatSelf(pathname, kfsattr, computeFilesize, 0, 0,
         kValidSubCountsRequiredFlag);
+}
+
+int
+KfsClientImpl::Stat(int fd, KfsFileAttr& kfsattr)
+{
+    QCStMutexLocker l(mMutex);
+
+    if (! valid_fd(fd)) {
+        return -EBADF;
+    }
+    FileTableEntry& entry = *(mFileTable[fd]);
+    kfsattr          = entry.fattr;
+    kfsattr.filename = entry.name;
+    return 0;
 }
 
 int
@@ -2294,21 +2394,7 @@ KfsClientImpl::LookupAttr(kfsFileId_t parentFid, const string& filename,
     }
     if (fa) {
         // Update i-node cache.
-        if (! path.empty() && path[0] == '/') {
-                if (fa->nameIt == mPathCacheNone) {
-                    if (filename != "." && filename != "..") {
-                        fa->nameIt =
-                            mPathCache.insert(make_pair(path, fa)).first;
-                        assert(fa->nameIt->second == fa);
-                    }
-                } else if (fa->nameIt->first != path) {
-                    mPathCache.erase(fa->nameIt);
-                    mPathCache[path] = fa;
-                }
-        } else if (fa->nameIt != mPathCacheNone) {
-            mPathCache.erase(fa->nameIt);
-            fa->nameIt = mPathCacheNone;
-        }
+        UpdatePath(fa, path);
         FAttrLru::PushBack(mFAttrLru, *fa);
     } else {
         fa = NewFAttr(parentFid, filename, path);
@@ -2912,15 +2998,6 @@ KfsClientImpl::OpenSelf(const char *pathname, int openMode, int numReplicas,
     if ((openMode & (O_CREAT|O_EXCL)) == (O_CREAT|O_EXCL)) {
         return -EEXIST;
     }
-    if (! cacheAttributesFlag &&
-            op.fattr.IsAnyPermissionDefined() && (((
-                    (openMode & O_WRONLY) == 0 ||
-                    (openMode & (O_RDWR | O_RDONLY)) != 0) &&
-                ! op.fattr.CanRead(mEUser, mEGroup)) || (
-                    (openMode & (O_WRONLY | O_RDWR)) != 0 &&
-                ! op.fattr.CanWrite(mEUser, mEGroup)))) {
-        return -EACCES;
-    }
     if (op.fattr.isDirectory && openMode != O_RDONLY) {
         return -ENOTDIR;
     }
@@ -3126,6 +3203,7 @@ KfsClientImpl::Truncate(const char* pathname, chunkOff_t offset)
         return -EACCES;
     }
     TruncateOp op(nextSeq(), pathname, attr.fileId, offset);
+    op.setEofHintFlag = attr.numStripes > 1;
     DoMetaOpWithRetry(&op);
     if (op.status != 0) {
         return op.status;
@@ -3150,6 +3228,7 @@ KfsClientImpl::TruncateSelf(int fd, chunkOff_t offset)
 
     FileAttr *fa = FdAttr(fd);
     TruncateOp op(nextSeq(), FdInfo(fd)->pathname.c_str(), fa->fileId, offset);
+    op.setEofHintFlag = fa->numStripes > 1;
     DoMetaOpWithRetry(&op);
     int res = op.status;
 
@@ -3868,7 +3947,11 @@ KfsClientImpl::UpdateFilesize(int fd)
         return -EBADF;
     }
     FileTableEntry& entry = *(mFileTable[fd]);
-    FAttr* const fa = LookupFAttr(entry.parentFid, entry.name);
+    FAttr* fa = LookupFAttr(entry.parentFid, entry.name);
+    if (fa && fa->generation != mFAttrCacheGeneration) {
+        Delete(fa);
+        fa = 0;
+    }
     if (entry.fattr.isDirectory ||
             entry.fattr.striperType != KFS_STRIPED_FILE_TYPE_NONE) {
         LookupOp op(nextSeq(), entry.parentFid, entry.name.c_str());
@@ -4162,10 +4245,17 @@ KfsClientImpl::NewFAttr(kfsFileId_t parentFid, const string& name,
     pair<FidNameToFAttrMap::iterator, bool> const res =
         mFidNameToFAttrMap.insert(make_pair(make_pair(parentFid, name), fa));
     if (! res.second) {
+        const FAttr* const cfa = res.first->second;
         KFS_LOG_STREAM_FATAL << "fattr entry already exists: " <<
-            " fid: "  << parentFid <<
-            " name: " << name <<
+            " parent: "  << parentFid <<
+            " name: "    << name <<
+            " path: "    << pathname <<
+            " gen: "     << mFAttrCacheGeneration <<
+            " entry:"
+            " gen: "     << cfa->generation <<
+            " path: "    << cfa->nameIt->first <<
         KFS_LOG_EOM;
+        MsgLogger::Stop();
         abort();
     }
     fa->fidNameIt = res.first;
@@ -4174,11 +4264,25 @@ KfsClientImpl::NewFAttr(kfsFileId_t parentFid, const string& name,
         pair<NameToFAttrMap::iterator, bool> const
             res = mPathCache.insert(make_pair(pathname, fa));
         if (! res.second) {
-            KFS_LOG_STREAM_FATAL << "fattr path entry already exists: " <<
-                " fid: "  << parentFid <<
-                " name: " << name <<
-            KFS_LOG_EOM;
-            abort();
+            FAttr* const cfa = res.first->second;
+            if (cfa->generation == mFAttrCacheGeneration ||
+                    cfa->nameIt != res.first) {
+                KFS_LOG_STREAM_FATAL << "fattr path entry already exists: " <<
+                    " parent: "  << parentFid <<
+                    " name: "    << name <<
+                    " path: "    << pathname <<
+                    " gen: "     << mFAttrCacheGeneration <<
+                    " entry:"
+                    " gen: "     << cfa->generation <<
+                    " parent: "  << cfa->fidNameIt->first.first <<
+                    " name: "    << cfa->fidNameIt->first.second <<
+                KFS_LOG_EOM;
+                MsgLogger::Stop();
+                abort();
+            }
+            cfa->nameIt = mPathCacheNone;
+            Delete(cfa);
+            res.first->second = fa;
         }
         fa->nameIt = res.first;
     } else {
@@ -4257,9 +4361,21 @@ KfsClientImpl::UpdatePath(KfsClientImpl::FAttr* fa, const string& path,
     if (fa->nameIt != mPathCacheNone) {
         mPathCache.erase(fa->nameIt);
     }
-    fa->nameIt = mPathCache.insert(
+    const string& name = fa->fidNameIt->first.second;
+    if (name == "." || name == ".." || path.empty() || path[0] != '/') {
+        fa->nameIt = mPathCacheNone;
+        return;
+    }
+    pair<NameToFAttrMap::iterator, bool> const res = mPathCache.insert(
         make_pair(copyPathFlag ? string(path.data(), path.length()) : path, fa)
-    ).first;
+    );
+    if (res.second) {
+        fa->nameIt = res.first;
+        return;
+    }
+    res.first->second->nameIt = mPathCacheNone;
+    res.first->second = fa;
+    fa->nameIt = res.first;
 }
 
 ///
@@ -4437,6 +4553,63 @@ KfsClientImpl::GetPathComponents(const char* pathname, kfsFileId_t* parentFid,
 }
 
 int
+KfsClientImpl::GetReplication(const char* pathname,
+    KfsFileAttr& attr, int& minChunkReplication, int& maxChunkReplication)
+{
+    QCStMutexLocker l(mMutex);
+
+    int ret;
+    if ((ret = StatSelf(pathname, attr, false))  < 0) {
+        KFS_LOG_STREAM_DEBUG << (pathname ?  pathname : "null") << ": " <<
+            ErrorCodeToStr(ret) <<
+        KFS_LOG_EOM;
+        return -ENOENT;
+    }
+    if (attr.isDirectory) {
+        KFS_LOG_STREAM_DEBUG << pathname << ": is a directory" << KFS_LOG_EOM;
+        return -EISDIR;
+    }
+    KFS_LOG_STREAM_DEBUG << "path: " << pathname <<
+        " file id: " << attr.fileId <<
+    KFS_LOG_EOM;
+
+    GetLayoutOp lop(nextSeq(), attr.fileId);
+    DoMetaOpWithRetry(&lop);
+    if (lop.status < 0) {
+        KFS_LOG_STREAM_ERROR << "get layout failed on path: " << pathname << " "
+             << ErrorCodeToStr(lop.status) <<
+        KFS_LOG_EOM;
+        return lop.status;
+    }
+    if (lop.ParseLayoutInfo()) {
+        KFS_LOG_STREAM_ERROR << "unable to parse layout for path: " << pathname <<
+        KFS_LOG_EOM;
+        return -EFAULT;
+    }
+    maxChunkReplication = 0;
+    if (lop.chunks.empty()) {
+        minChunkReplication = 0;
+    } else {
+        minChunkReplication = numeric_limits<int>::max();
+        for (vector<ChunkLayoutInfo>::const_iterator i = lop.chunks.begin();
+                i != lop.chunks.end();
+                ++i) {
+            const int numReplicas = (int)i->chunkServers.size();
+            if (numReplicas < minChunkReplication) {
+                minChunkReplication = numReplicas;
+            }
+            if (numReplicas > maxChunkReplication) {
+                maxChunkReplication = numReplicas;
+            }
+        }
+    }
+    if (attr.subCount1 < (int64_t)lop.chunks.size()) {
+        attr.subCount1 = (int64_t)lop.chunks.size();
+    }
+    return 0;
+}
+
+int
 KfsClientImpl::EnumerateBlocks(const char* pathname, KfsClient::BlockInfos& res)
 {
     QCStMutexLocker l(mMutex);
@@ -4469,7 +4642,7 @@ KfsClientImpl::EnumerateBlocks(const char* pathname, KfsClient::BlockInfos& res)
     if (lop.ParseLayoutInfo()) {
         KFS_LOG_STREAM_ERROR << "unable to parse layout for path: " << pathname <<
         KFS_LOG_EOM;
-        return -1;
+        return -EINVAL;
     }
 
     vector<ssize_t> chunksize;
@@ -4673,6 +4846,13 @@ KfsClientImpl::Chmod(const char* pathname, kfsMode_t mode)
     return 0;
 }
 
+kfsUid_t
+KfsClientImpl::GetUserId()
+{
+    QCStMutexLocker l(mMutex);
+    return mEUser;
+}
+
 int
 KfsClientImpl::GetUserAndGroup(const char* user, const char* group,
     kfsUid_t& uid, kfsGid_t& gid)
@@ -4800,7 +4980,7 @@ public:
                 return ret;
             }
         }
-        ChmodOp op(mCli.nextSeq(), attr.fileId, (attr.isDirectory ?
+        ChmodOp op(mCli.nextSeq(), attr.fileId, mMode & (attr.isDirectory ?
             kfsMode_t(Permissions::kDirModeMask) :
             kfsMode_t(Permissions::kFileModeMask)));
         mCli.DoMetaOpWithRetry(&op);
@@ -4996,6 +5176,62 @@ KfsClientImpl::ChownR(const char* pathname, kfsUid_t user, kfsGid_t group,
     }
     DefaultErrHandler errorHandler;
     ChownFunc funct(*this, user, group, errHandler ? *errHandler : errorHandler);
+    const int ret = RecursivelyApply(pathname, funct);
+    return (errHandler ? ret : (ret != 0 ? ret : errorHandler.GetStatus()));
+}
+
+class SetReplicationFactorFunc
+{
+public:
+    typedef KfsClient::ErrorHandler ErrorHandler;
+
+    SetReplicationFactorFunc(KfsClientImpl& cli, int16_t repl,
+        ErrorHandler& errHandler)
+        : mCli(cli),
+          mReplication(repl),
+          mErrHandler(errHandler)
+        {}
+    int operator()(const string& path, const KfsFileAttr& attr,
+        int status) const
+    {
+        if (status != 0) {
+            const int ret = mErrHandler(path, status);
+            if (ret != 0) {
+                return ret;
+            }
+        }
+        if (attr.isDirectory) {
+            return 0;
+        }
+        ChangeFileReplicationOp op(mCli.nextSeq(), attr.fileId, mReplication);
+        mCli.DoMetaOpWithRetry(&op);
+        if (op.status != 0) {
+            const int ret = mErrHandler(path, op.status);
+            if (ret != 0) {
+                return ret;
+            }
+        }
+        return 0;
+    }
+private:
+    KfsClientImpl& mCli;
+    const int16_t  mReplication;
+    ErrorHandler&  mErrHandler;
+};
+
+int16_t
+KfsClientImpl::SetReplicationFactorR(const char *pathname, int16_t numReplicas,
+    KfsClientImpl::ErrorHandler* errHandler)
+{
+    QCStMutexLocker l(mMutex);
+
+    // Even though meta server supports recursive set replication, do it one
+    // file at a time, in order to prevent "DoS".
+    // For this reason meta server might not support recursive version in the
+    // future releases. 
+    DefaultErrHandler errorHandler;
+    SetReplicationFactorFunc funct(
+        *this, numReplicas, errHandler ? *errHandler : errorHandler);
     const int ret = RecursivelyApply(pathname, funct);
     return (errHandler ? ret : (ret != 0 ? ret : errorHandler.GetStatus()));
 }
@@ -5200,9 +5436,8 @@ KfsClientImpl::UidToName(kfsUid_t uid, time_t now)
     if (it == mUserNames.end() || it->second.second < now) {
         struct passwd  pwebuf = {0};
         struct passwd* pwe    = 0;
-        char           nameBuf[1024];
         const int err = getpwuid_r((uid_t)uid,
-            &pwebuf, nameBuf, sizeof(nameBuf), &pwe);
+            &pwebuf, mNameBuf, mNameBufSize, &pwe);
         string name;
         if (err || ! pwe) {
             ostream& os = mTmpOutputStream.Set(mTmpBuffer, kTmpBufferSize);
@@ -5235,9 +5470,8 @@ KfsClientImpl::GidToName(kfsGid_t gid, time_t now)
     if (it == mGroupNames.end() || it->second.second < now) {
         struct group  gbuf = {0};
         struct group* pge  = 0;
-        char          nameBuf[1024];
         const int err = getgrgid_r((gid_t)gid,
-            &gbuf, nameBuf, sizeof(nameBuf), &pge);
+            &gbuf, mNameBuf, mNameBufSize, &pge);
         string name;
         if (err || ! pge) {
             ostream& os = mTmpOutputStream.Set(mTmpBuffer, kTmpBufferSize);
@@ -5267,9 +5501,8 @@ KfsClientImpl::NameToUid(const string& name, time_t now)
     if (it == mUserIds.end() || it->second.second < now) {
         struct passwd  pwebuf = {0};
         struct passwd* pwe    = 0;
-        char           nameBuf[1024];
         const int err = getpwnam_r(name.c_str(),
-            &pwebuf, nameBuf, sizeof(nameBuf), &pwe);
+            &pwebuf, mNameBuf, mNameBufSize, &pwe);
         kfsUid_t uid;
         if (err || ! pwe) {
             char* end = 0;
@@ -5299,9 +5532,8 @@ KfsClientImpl::NameToGid(const string& name, time_t now)
     if (it == mGroupIds.end() || it->second.second < now) {
         struct group  gbuf = {0};
         struct group* pge  = 0;
-        char          nameBuf[1024];
         const int err = getgrnam_r(name.c_str(),
-            &gbuf, nameBuf, sizeof(nameBuf), &pge);
+            &gbuf, mNameBuf, mNameBufSize, &pge);
         kfsGid_t gid;
         if (err || ! pge) {
             char* end = 0;

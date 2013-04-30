@@ -273,6 +273,8 @@ public:
     ///
     string GetCwd();
 
+    int SetCwd(const char* pathname);
+
     ///
     /// Make a directory hierarcy in KFS.  If the parent dirs are not
     /// present, they are also made.
@@ -338,7 +340,8 @@ public:
     /// file is computed and the value is returned in result.st_size
     /// @retval 0 if stat was successful; -errno otherwise
     ///
-    int Stat(const char *pathname, KfsFileAttr &result, bool computeFilesize = true);
+    int Stat(const char* pathname, KfsFileAttr& result, bool computeFilesize = true);
+    int Stat(int fd, KfsFileAttr& result);
 
     ///
     /// Return the # of chunks in the file specified by the fully qualified pathname.
@@ -542,6 +545,9 @@ public:
     /// @retval -1 on failure; on success, the # of replicas that will be made.
     ///
     int16_t SetReplicationFactor(const char *pathname, int16_t numReplicas);
+    // Recursive version.
+    int16_t SetReplicationFactorR(const char *pathname, int16_t numReplicas,
+        ErrorHandler* errHandler = 0);
 
     void SetDefaultIOTimeout(int nsecs);
     int  GetDefaultIOTimeout() const;
@@ -589,6 +595,12 @@ public:
         kfsGid_t* groups, int groupsCnt);
     int GetUserAndGroupNames(kfsUid_t user, kfsGid_t group,
         string& uname, string& gname);
+    int GetUserAndGroupIds(const char* user, const char* group,
+        kfsUid_t& uid, kfsGid_t& gid)
+        { return GetUserAndGroup(user, group, uid, gid); }
+    kfsUid_t GetUserId();
+    int GetReplication(const char* pathname,
+        KfsFileAttr& attr, int& minChunkReplication, int& maxChunkReplication);
 
 private:
      /// Maximum # of files a client can have open.
@@ -738,6 +750,8 @@ private:
     GroupIds                       mGroupIds;
     BufferInputStream              mTmpInputStream;
     BufferOutpuStream              mTmpOutputStream;
+    const size_t                   mNameBufSize;
+    char* const                    mNameBuf;
     KfsClientImpl*                 mPrevPtr[1];
     KfsClientImpl*                 mNextPtr[1];
 
@@ -933,6 +947,7 @@ private:
     friend struct RespondingServer2;
     friend class ChmodFunc;
     friend class ChownFunc;
+    friend class SetReplicationFactorFunc;
 };
 
 }}

@@ -44,6 +44,7 @@
 #include "qcdio/QCUtils.h"
 #include "qcdio/qcstutils.h"
 #include "common/time.h"
+#include "common/kfserrno.h"
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -138,7 +139,8 @@ OkHeader(const MetaRequest* op, ostream &os, bool checkStatus = true)
     }
     os <<
         "\r\n"
-        "Status: " << op->status << "\r\n"
+        "Status: " << (op->status >= 0 ? op->status :
+            -SysToKfsErrno(-op->status)) << "\r\n"
     ;
     if (! op->statusMsg.empty()) {
         const size_t p = op->statusMsg.find('\r');
@@ -1324,6 +1326,9 @@ MetaGetlayout::handle()
     } else {
         status = metatree.getalloc(fid, startOffset, chunkInfo,
             maxResCnt > 0 ? maxResCnt + 1 : maxResCnt);
+        if (status == -ENOENT && (fa = metatree.getFattr(fid))) {
+            status = 0;
+        }
     }
     if (status != 0) {
         return;
@@ -1334,7 +1339,7 @@ MetaGetlayout::handle()
             status = -EFAULT;
             return;
         }
-        fa = CSMap::Entry::GetCsEntry(chunkInfo.front())->GetFattr();
+        fa = chunkInfo.front()->getFattr();
         if (! fa) {
             panic("MetaGetlayout::handle -- invalid chunk entry");
             status = -EFAULT;
@@ -1462,8 +1467,8 @@ MetaAllocate::handle()
             return;
         }
         // pick a chunk for which a write lease exists
-        status = gLayoutManager.AllocateChunkForAppend(this);
-        if (status == 0) {
+        status = 0;
+        if (gLayoutManager.AllocateChunkForAppend(this) == 0) {
             // all good
             KFS_LOG_STREAM_DEBUG <<
                 "For append re-using chunk " << chunkId <<
@@ -1472,7 +1477,7 @@ MetaAllocate::handle()
             logFlag = false; // Do not emit redundant log record.
             return;
         }
-        if (status == -EACCES) {
+        if (status != 0) {
             return;
         }
         offset = -1; // Allocate a new chunk past eof.
@@ -1500,7 +1505,6 @@ MetaAllocate::handle()
         // we have a problem
         return;
     }
-    permissions = *fa;
     if (stripedFileFlag && appendChunk) {
         status    = -EINVAL;
         statusMsg = "append is not supported with striped files";
@@ -1541,6 +1545,7 @@ MetaAllocate::handle()
         status = -ENOENT;
         return;
     }
+    permissions = fa;
     int ret;
     if (status == -EEXIST) {
         initialChunkVersion = chunkVersion;
@@ -1655,7 +1660,8 @@ MetaAllocate::LayoutDone(int64_t chunkAllocProcessTime)
             if (appendChunk && status == -EEXIST) {
                 panic("append chunk allocation internal error",
                     false);
-            } else if (status == -EEXIST && curChunkId != chunkId) {
+            } else if (status == -ENOENT ||
+                    (status == -EEXIST && curChunkId != chunkId)) {
                 gLayoutManager.DeleteChunk(this);
             }
         }
@@ -1875,8 +1881,13 @@ MetaTruncate::handle()
         status = metatree.pruneFromHead(fid, offset, &mtime, eu, egroup);
         return;
     }
-    const string path(pathname.GetStr());
-    status = metatree.truncate(fid, offset, path, &mtime, eu, egroup);
+    if (endOffset >= 0 && endOffset < offset) {
+        status    = -EINVAL;
+        statusMsg = "end offset less than offset";
+        return;
+    }
+    status = metatree.truncate(fid, offset, &mtime, eu, egroup,
+        endOffset, setEofHintFlag);
 }
 
 /* virtual */ void
@@ -2811,11 +2822,11 @@ MetaCheckpoint::handle()
         return;
     }
     runningCheckpointId = oplog.checkpointed();
-    if ((pid = DoFork(chekpointWriteTimeoutSec)) == 0) {
+    if ((pid = DoFork(checkpointWriteTimeoutSec)) == 0) {
         metatree.disableFidToPathname();
         metatree.recomputeDirSize();
-        cp.setWriteSyncFlag(chekpointWriteSyncFlag);
-        cp.setWriteBufferSize(chekpointWriteBufferSize);
+        cp.setWriteSyncFlag(checkpointWriteSyncFlag);
+        cp.setWriteBufferSize(checkpointWriteBufferSize);
         status = cp.do_CP();
         // Child does not attempt graceful exit.
         _exit(status == 0 ? 0 : 1);
@@ -2849,15 +2860,15 @@ MetaCheckpoint::SetParameters(const Properties& props)
         "metaServer.checkpoint.lockFileName",   lockFileName);
     maxFailedCount = max(0, props.getValue(
         "metaServer.checkpoint.maxFailedCount", maxFailedCount));
-    chekpointWriteTimeoutSec = max(0, (int)props.getValue(
-        "metaServer.chekpoint.writeTimeoutSec",
-        (double)chekpointWriteTimeoutSec));
-    chekpointWriteSyncFlag = props.getValue(
-        "metaServer.chekpoint.writeSync",
-        chekpointWriteSyncFlag ? 0 : 1) != 0;
-    chekpointWriteBufferSize = props.getValue(
-        "metaServer.chekpoint.writeBufferSize",
-        chekpointWriteBufferSize);
+    checkpointWriteTimeoutSec = max(0, (int)props.getValue(
+        "metaServer.checkpoint.writeTimeoutSec",
+        (double)checkpointWriteTimeoutSec));
+    checkpointWriteSyncFlag = props.getValue(
+        "metaServer.checkpoint.writeSync",
+        checkpointWriteSyncFlag ? 0 : 1) != 0;
+    checkpointWriteBufferSize = props.getValue(
+        "metaServer.checkpoint.writeBufferSize",
+        checkpointWriteBufferSize);
 }
 
 /*!
@@ -3055,7 +3066,11 @@ MetaTruncate::log(ostream &file) const
             << "/mtime/" << ShowTime(mtime) << '\n';
     } else {
         file << "truncate/file/" << fid << "/offset/" << offset
-            << "/mtime/" << ShowTime(mtime) << '\n';
+            << "/mtime/" << ShowTime(mtime);
+        if (endOffset >= 0) {
+            file << "/endoff/" << endOffset;
+        }
+        file << '\n';
     }
     return file.fail() ? -EIO : 0;
 }
@@ -3831,7 +3846,13 @@ MetaChunkDirInfo::response(ostream& os)
 void
 MetaTruncate::response(ostream &os)
 {
-    PutHeader(this, os) << "\r\n";
+    if (! OkHeader(this, os)) {
+        return;
+    }
+    if (endOffset >= 0) {
+        os << "End-offset: " << endOffset << "\r\n";
+    }
+    os << "\r\n";
 }
 
 void

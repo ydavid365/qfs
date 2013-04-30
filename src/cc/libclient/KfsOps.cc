@@ -38,6 +38,7 @@
 
 #include "kfsio/checksum.h"
 #include "common/RequestParser.h"
+#include "common/kfserrno.h"
 #include "utils.h"
 
 namespace KFS
@@ -355,6 +356,13 @@ TruncateOp::Request(ostream &os)
     if (pruneBlksFromHead) {
         os << "Prune-from-head: 1\r\n";
     }
+    if (! setEofHintFlag) {
+        // Default is true
+        os << "Set-eof: 0\r\n";
+    }
+    if (endOffset >= 0) {
+        os << "End-offset: " << endOffset << "\r\n";
+    }
     os << "\r\n";
 }
 
@@ -639,6 +647,9 @@ GetRecordAppendOpStatus::ParseResponseHeaderSelf(const Properties &prop)
     chunkVersion        = prop.getValue("Chunk-version",               (int64_t)-1);
     opSeq               = prop.getValue("Op-seq",                      (int64_t)-1);
     opStatus            = prop.getValue("Op-status",                   -1);
+    if (opStatus < 0) {
+        opStatus = -KfsToSysErrno(-opStatus);
+    }
     opOffset            = prop.getValue("Op-offset",                   (int64_t)-1);
     opLength            = (size_t)prop.getValue("Op-length",           (uint64_t)0);
     widAppendCount      = (size_t)prop.getValue("Wid-append-count",    (uint64_t)0);
@@ -681,6 +692,9 @@ KfsOp::ParseResponseHeader(const Properties& prop)
 {
     // kfsSeq_t resSeq = prop.getValue("Cseq", (kfsSeq_t) -1);
     status = prop.getValue("Status", -1);
+    if (status < 0) {
+        status = -KfsToSysErrno(-status);
+    }
     contentLength = prop.getValue("Content-length", 0);
     statusMsg = prop.getValue("Status-message", string());
     ParseResponseHeaderSelf(prop);
@@ -1052,6 +1066,17 @@ ChownOp::Request(ostream &os)
         os << "Group: " << group << "\r\n";
     }
     os << "\r\n";
+}
+
+void
+TruncateOp::ParseResponseHeaderSelf(const Properties& prop)
+{
+    respEndOffset = prop.getValue("End-offset", int64_t(-1));
+    if (status == 0 && ! pruneBlksFromHead &&
+            endOffset >= 0 && respEndOffset != endOffset) {
+        status    = -EFAULT;
+        statusMsg = "range truncate is not supported";
+    }
 }
 
 } //namespace client

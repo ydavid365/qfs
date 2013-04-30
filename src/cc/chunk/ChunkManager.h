@@ -301,11 +301,7 @@ public:
 
     virtual void Timeout();
 
-    /// Push the changes from the write out to disk
-    int Sync(WriteOp *op);
-
     ChunkInfo_t* GetChunkInfo(kfsChunkId_t chunkId);
-    
 
     void ChunkIOFailed(kfsChunkId_t chunkId, int err, const DiskIo::File* file);
     void ChunkIOFailed(kfsChunkId_t chunkId, int err, const DiskIo* diskIo);
@@ -376,6 +372,8 @@ public:
         { return mMaxEvacuateIoErrors; }
     int GetAvailableChunksRetryInterval() const
         { return mAvailableChunksRetryInterval; }
+    bool IsSyncChunkHeader() const
+        { return mSyncChunkHeaderFlag; }
     // The following are "internal/private" -- to be used only withing
     // ChunkManager.cpp
     inline ChunkInfoHandle* AddMapping(ChunkInfoHandle* cih);
@@ -716,6 +714,7 @@ private:
     int64_t mMinPendingIoThreshold;
     bool mAllowSparseChunksFlag;
     bool mBufferedIoFlag;
+    bool mSyncChunkHeaderFlag;
 
     uint32_t mNullBlockChecksum;
 

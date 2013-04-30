@@ -128,8 +128,8 @@ def kill_running_program(binaryPath):
         checkPath = os.path.split(binaryPath)[1]
         if not checkPath:
             return
-        cmd = ('ps -ef | grep %s | grep -v grep | awk \'{print $2}\''
-               % checkPath)
+        cmd = ('ps -ef | grep %s | grep %s | grep -v grep | awk \'{print $2}\''
+               % (os.getlogin(), checkPath))
         res = subprocess.Popen(cmd, shell=True,
                                stdout=subprocess.PIPE).communicate()
         pids = res[0].split('\n')
@@ -138,8 +138,8 @@ def kill_running_program(binaryPath):
                 os.kill(int(pid.strip()), signal.SIGTERM)
     else:
         if binaryPath.find('qfsstatus') >= 0:
-            cmd = ('ps -ef | grep /qfsbase/ | grep %s | grep -v grep | awk \'{print $2}\''
-                   % binaryPath)
+            cmd = ('ps -ef | grep %s | grep /qfsbase/ | grep %s | grep -v grep | awk \'{print $2}\''
+                   % (os.getlogin(), binaryPath))
             res = subprocess.Popen(cmd, shell=True,
                                    stdout=subprocess.PIPE).communicate()
             pids = res[0].split('\n')
@@ -269,6 +269,18 @@ Hello World example of a client session:
   # Stop the server and remove the custom install.
   ./examples/sampleservers/sample_setup.py -a stop
   ./examples/sampleservers/sample_setup.py -a uninstall
+
+Use qfs to manipulate files the same way you would use 'hadoop fs':
+  # Set qfs command alias.
+  alias qfs='<QFS_INSTALL_PATH>/bin/tools/qfs \
+      -cfg ./examples/sampleservers/sample_qfs_tool.cfg'
+
+  qfs -h
+  qfs -stat /
+  qfs -mkdir /some-dir
+  qfs -ls /
+
+  Did you notice how fast it is? :)
 """
 
     # An install sets up all config files and (re)starts the servers.
@@ -335,7 +347,9 @@ def do_cleanup(config, doUninstall):
             if doUninstall and os.path.isdir(webDir):
                 rm_tree(webDir)
     if doUninstall:
-        os.rmdir(os.path.expanduser('~/qfsbase'))
+        qfsbase = os.path.expanduser('~/qfsbase')
+        if os.path.isdir(qfsbase):
+            os.rmdir(qfsbase)
         print 'Uninstall - OK.'
     else:
         print 'Stop servers - OK.'
